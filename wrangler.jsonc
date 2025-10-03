@@ -1,8 +1,38 @@
 /**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
+ *  IMPORTANT — edit these before deploying:
+ *
+ *  1) Set "account_id" to your Cloudflare account id (or set ACCOUNT_ID in vars).
+ *
+ *  2) Secrets Store bindings:
+ *     - The worker READS two bootstrap secrets (these must exist and have values):
+ *         * PRIMARY_TOKEN_CREATION_TOKEN   -> token used to CREATE account API tokens
+ *         * PRIMARY_SECRET_EDIT_TOKEN      -> token used to PUT/UPDATE Secrets Store entries
+ *       These are bootstrap credentials the worker reads at runtime.
+ *
+ *     - The worker performs a 2-slot swap in the same store:
+ *         * Before creating new tokens, the current PRIMARY_* values are copied to SECONDARY_* names
+ *         * After successful creation and verification, the worker OVERWRITES PRIMARY_TOKEN_CREATION_TOKEN
+ *           and PRIMARY_SECRET_EDIT_TOKEN with the newly created values.
+ *       This keeps exactly two slots: PRIMARY (active) and SECONDARY (previous).
+ *
+ *     - Keep any other secrets (e.g. ACS_ACCESS_KEY for mailer) in the same list if the worker needs them.
+ *
+ *  3) KV namespace:
+ *     - KV_CACHE is used as a lightweight lock mechanism to avoid concurrent rotations.
+ *       (No separate meta KV is used in this model.)
+ *
+ *  4) Cron:
+ *     - Configure scheduled rotation in "triggers.crons" (example: "0 * * * *" = once per hour).
+ *     - The scheduled handler exported by the worker must be: `export default { async scheduled(...) { ... } }`.
+ *
+ *  NOTE:
+ *  - The worker reads bootstrap secrets at runtime with:
+ *      await env.PRIMARY_TOKEN_CREATION_TOKEN.get()
+ *      await env.PRIMARY_SECRET_EDIT_TOKEN.get()
+ *  - The worker updates Secrets Store programmatically using the secret-edit bootstrap (PUT).
  */
 {
+	"account_id": "610496ac00ef9a268f611d5a29234d53",
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "root-token-manager",
 	"main": "src/index.ts",
@@ -10,39 +40,59 @@
 	"observability": {
 		"enabled": true
 	},
-	/**
-	 * Smart Placement
-	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
-	 */
-	// "placement": { "mode": "smart" }
-	/**
-	 * Bindings
-	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
-	 * databases, object storage, AI inference, real-time communication and more.
-	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
-	 */
-	/**
-	 * Environment Variables
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
-	 */
-	// "vars": { "MY_VARIABLE": "production_value" }
-	/**
-	 * Note: Use secrets to store sensitive data.
-	 * https://developers.cloudflare.com/workers/configuration/secrets/
-	 */
-	/**
-	 * Static Assets
-	 * https://developers.cloudflare.com/workers/static-assets/binding/
-	 */
-	// "assets": { "directory": "./public/", "binding": "ASSETS" }
-	/**
-	 * Service Bindings (communicate between multiple Workers)
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
-	 */
-	// "services": [{ "binding": "MY_SERVICE", "service": "my-service" }]
+	"vars": {
+		"ACCOUNT_ID": "610496ac00ef9a268f611d5a29234d53",
+		"ACS_EMAIL_ENDPOINT": "https://communications-client.europe.communication.azure.com/emails:send?api-version=2025-09-01"
+	},
+
+	// Secrets store bindings you must populate:
+	// - binding: runtime binding name used in env.<binding>.get()
+	// - secret_name: the Secrets Store secret identifier (in Cloudflare)
+	// - store_id: the ID of the secrets store (if required by your account)
+	"secrets_store_secrets": [
+		{
+			"binding": "PRIMARY_TOKEN_CREATION_TOKEN",
+			"secret_name": "PRIMARY_TOKEN_CREATION_TOKEN",
+			"store_id": "d218845e95eb47b3ba53bf34577cb94f"
+		},
+		{
+			"binding": "PRIMARY_SECRET_EDIT_TOKEN",
+			"secret_name": "PRIMARY_SECRET_EDIT_TOKEN",
+			"store_id": "d218845e95eb47b3ba53bf34577cb94f"
+		},
+		{
+			"binding": "SECONDARY_TOKEN_CREATION_TOKEN",
+			"secret_name": "SECONDATY_TOKEN_CREATION_TOKEN",
+			"store_id": "d218845e95eb47b3ba53bf34577cb94f"
+		},
+		{
+			"binding": "SECONDARY_SECRET_EDIT_TOKEN",
+			"secret_name": "SECONDARY_SECRET_EDIT_TOKEN",
+			"store_id": "d218845e95eb47b3ba53bf34577cb94f"
+		},
+		{
+			"binding": "ACS_ACCESS_KEY",
+			"secret_name": "ACS_ACCESS_KEY",
+			"store_id": "d218845e95eb47b3ba53bf34577cb94f"
+		}
+	],
+
+	// KV namespaces for locks
+	"kv_namespaces": [
+		{
+			"binding": "KV_CACHE",
+			"id": "a0336613efda4f138439798c4df9fa25",
+			"preview_id": "8086bce4f4724e9a89d3c02334b6611e",
+			"remote": true
+		}
+	],
+
+	"placement": { "mode": "smart" },
+
+	"minify": true,
+
+	// Run hourly by default (change if you want different cadence)
 	"triggers": {
-		"crons": [
-			"* * * * *"
-		]
+		"crons": ["0 * * * *"]
 	}
 }

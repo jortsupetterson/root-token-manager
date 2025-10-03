@@ -63,6 +63,10 @@ This simplifies coordination and reduces edge-case complexity: no separate next/
 
 ---
 
+### Bootstrap nuance — secondary secrets must exist
+
+Important operational note: the **SECONDARY** secret entries must already exist in the Secrets Store at bootstrap time (they can hold any value, including an empty string `""`). The worker expects the secondary secret names to be present so the first scheduled run can atomically stage PRIMARY → SECONDARY and then populate PRIMARY with newly-created tokens. The system becomes fully operational only after the first successful rotation when **both** PRIMARY and SECONDARY contain valid token values.
+
 ## Commands
 
 - Generate types (recommended):

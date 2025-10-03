@@ -32,6 +32,18 @@ A short KV lock prevents overlapping runs. All errors are logged and trigger a s
 
 ---
 
+## Grace window / fallback behavior (key point)
+
+This design purposefully _removes_ a separate "grace window" state by relying on token TTL and a deterministic two-slot swap. The important properties are:
+
+- New tokens are created with a **~2 hour TTL** (configurable in code).
+- Rotation runs **every hour** by default. Because a freshly created token remains valid for ~2 hours, the _SECONDARY_ slot (which holds the previous PRIMARY values) is always a valid fallback if the PRIMARY is unavailable, pending, or otherwise failing during an operation (for example, when the SECRET_EDIT token is used to rotate other secrets).
+- In other words: **SECONDARY is guaranteed to work as a fallback** for at least the next rotation cycle, avoiding complex grace-window logic. This gives deterministic behavior when consumers try to use a token during a rotate: try PRIMARY; if it fails, fallback to SECONDARY.
+
+This simplifies coordination and reduces edge-case complexity: no separate next/current/grace states — just PRIMARY and a guaranteed working SECONDARY.
+
+---
+
 ## Files of interest
 
 - `src/index.ts` — TypeScript Worker implementation (scheduled handler + helpers).
@@ -111,6 +123,7 @@ npx wrangler types
 
 - Two bootstrap bindings only: **token-creation** + **secret-edit**.
 - Deterministic 2-slot swap: `PRIMARY ← new`, `SECONDARY ← previous`.
+- Because tokens live ~2 hours and rotation runs every hour, **SECONDARY is always a valid fallback** if PRIMARY fails.
 - KV lock prevents concurrent runs.
 - Single email alert on failure.
 - Use `npx wrangler deploy` to deploy.

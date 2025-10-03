@@ -62,7 +62,7 @@
 		},
 		{
 			"binding": "SECONDARY_TOKEN_CREATION_TOKEN",
-			"secret_name": "SECONDATY_TOKEN_CREATION_TOKEN",
+			"secret_name": "SECONDARY_TOKEN_CREATION_TOKEN",
 			"store_id": "d218845e95eb47b3ba53bf34577cb94f"
 		},
 		{

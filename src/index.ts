@@ -38,11 +38,45 @@ function resolveIds(env: Env): { accountId: string; storeId: string } {
 	return { accountId, storeId };
 }
 
-/**
- * Update existing secret by name
- * - Uses simple KV caching of secret_id: if cached id fails, will list store and refresh.
- * - Throws if secret not found or PATCH fails.
- */
+// --- paste into your index.ts to replace previous updateSecretByName / patchById ---
+
+async function patchById(
+	env: Env,
+	headers: Record<string, string>,
+	accountId: string,
+	storeId: string,
+	secretId: string,
+	secretValue: string
+): Promise<void> {
+	// basic sanity: ensure JSON serializable and not empty
+	let bodyObj: any = { value: secretValue };
+	let bodyStr: string;
+	try {
+		bodyStr = JSON.stringify(bodyObj);
+	} catch (e) {
+		throw new Error(`patchById: secret value not serializable: ${String(e)}`);
+	}
+
+	// optional quick debug logging (remove in prod)
+	if (bodyStr.length > 4096) {
+		console.warn(`patchById: secret payload length ${bodyStr.length} (might exceed store limits)`);
+	}
+
+	const patchUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets/${encodeURIComponent(
+		secretId
+	)}`;
+	const patchRes = await fetch(patchUrl, {
+		method: 'PATCH',
+		headers,
+		body: bodyStr,
+	});
+
+	if (!patchRes.ok) {
+		const t = await patchRes.text().catch(() => '<no body>');
+		throw new Error(`updateSecretByName: PATCH failed for id ${secretId} ${patchRes.status} ${t}`);
+	}
+}
+
 export async function updateSecretByName(env: Env, secretEditBootstrap: string, secretName: string, secretValue: string): Promise<void> {
 	const { accountId, storeId } = resolveIds(env);
 	const headers = {
@@ -50,46 +84,21 @@ export async function updateSecretByName(env: Env, secretEditBootstrap: string, 
 		'Content-Type': 'application/json',
 	};
 
-	// try cached id first
 	const cacheKey = SECRET_ID_KV_PREFIX + secretName;
+	// try cached id first
 	let cachedId: string | null = null;
 	try {
 		cachedId = await env.KV_CACHE.get(cacheKey);
 	} catch (e) {
-		// KV read error -> ignore and continue to list fallback
 		console.warn('KV_CACHE.get failed (ignoring):', String(e));
 		cachedId = null;
 	}
 
-	async function patchById(secretId: string): Promise<void> {
-		const patchUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets/${encodeURIComponent(
-			secretId
-		)}`;
-		const patchRes = await fetch(patchUrl, {
-			method: 'PATCH',
-			headers,
-			body: JSON.stringify({ text: secretValue }),
-		});
-		if (!patchRes.ok) {
-			const t = await patchRes.text().catch(() => '<no body>');
-			throw new Error(`updateSecretByName: PATCH failed for id ${secretId} ${patchRes.status} ${t}`);
-		}
-		// success -> update KV cache (freshen TTL to LOCK_TTL*2 to be safe)
-		try {
-			await env.KV_CACHE.put(cacheKey, secretId, { expirationTtl: LOCK_TTL * 2 });
-		} catch (e) {
-			// ignore cache write failures
-			console.warn('KV_CACHE.put failed (ignoring):', String(e));
-		}
-	}
-
-	// If we have cachedId, try patching directly
 	if (cachedId) {
 		try {
-			await patchById(cachedId);
+			await patchById(env, headers, accountId, storeId, cachedId, secretValue);
 			return;
 		} catch (e) {
-			// If patch fails with 404 or similar, drop cache and fall through to listing
 			console.warn('patchById with cachedId failed, will refresh list:', String(e));
 			try {
 				await env.KV_CACHE.delete(cacheKey);
@@ -97,7 +106,7 @@ export async function updateSecretByName(env: Env, secretEditBootstrap: string, 
 		}
 	}
 
-	// List secrets and find the secret name
+	// list secrets to find id
 	const listUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets`;
 	const listRes = await fetch(listUrl, { method: 'GET', headers });
 	if (!listRes.ok) {
@@ -111,8 +120,14 @@ export async function updateSecretByName(env: Env, secretEditBootstrap: string, 
 		throw new Error(`updateSecretByName: secret "${secretName}" not found in store ${storeId}`);
 	}
 
-	// patch found secret id
-	await patchById(found.id);
+	await patchById(env, headers, accountId, storeId, found.id, secretValue);
+
+	// cache id for next time
+	try {
+		await env.KV_CACHE.put(cacheKey, found.id, { expirationTtl: LOCK_TTL * 2 });
+	} catch (e) {
+		console.warn('KV_CACHE.put failed (ignoring):', String(e));
+	}
 }
 
 /**

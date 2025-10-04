@@ -29,10 +29,44 @@ export async function releaseLock(env: Env, token: string | null): Promise<void>
 }
 
 /** Secrets Store upsert via Cloudflare API (requires secret-edit bootstrap token) */
+/** Upsert a secret into Cloudflare Secrets Store (create or update).
+ *  Uses env.SECRET_STORE_ID (must be set). Requires secretEditBootstrap to have Secrets Store write/edit rights.
+ */
 export async function upsertSecret(env: Env, secretEditBootstrap: string, secretName: string, secretValue: string): Promise<void> {
 	const accountId = (env as any).ACCOUNT_ID ?? (env as any).account_id;
-	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/secrets/${encodeURIComponent(secretName)}`;
-	const res = await fetch(url, {
+	const storeId = (env as any).SECRET_STORE_ID;
+	if (!accountId) throw new Error('upsertSecret: account_id / ACCOUNT_ID not set in env');
+	if (!storeId) throw new Error('upsertSecret: SECRET_STORE_ID not set in env');
+
+	// 1) Try create (POST). This is the canonical Secrets Store create endpoint.
+	const createUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets`;
+	const createBody = {
+		name: secretName,
+		text: secretValue,
+		// attach to Workers runtime - keep this unless you need different services
+		services: ['workers'],
+	};
+
+	let res = await fetch(createUrl, {
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${secretEditBootstrap}`,
+			'Content-Type': 'application/json',
+		},
+		body: JSON.stringify(createBody),
+	});
+
+	if (res.ok) return; // created successfully
+
+	// 2) If POST failed, try to update (PUT). Some accounts require updating existing secret by name.
+	//    Use the secrets/{secret_name} path for update (safe to URL-encode the name).
+	//    If your API returns a different shape for update, adapt accordingly.
+	const txt = await res.text().catch(() => '');
+	// If response indicates 'already exists' or other non-critical problem, fall back to update.
+	const updateUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets/${encodeURIComponent(
+		secretName
+	)}`;
+	res = await fetch(updateUrl, {
 		method: 'PUT',
 		headers: {
 			Authorization: `Bearer ${secretEditBootstrap}`,
@@ -40,9 +74,10 @@ export async function upsertSecret(env: Env, secretEditBootstrap: string, secret
 		},
 		body: JSON.stringify({ text: secretValue }),
 	});
+
 	if (!res.ok) {
-		const txt = await res.text().catch(() => '');
-		throw new Error(`upsertSecret ${secretName} failed ${res.status} ${txt}`);
+		const errText = await res.text().catch(() => txt || '<no body>');
+		throw new Error(`upsertSecret ${secretName} failed ${res.status} ${errText}`);
 	}
 }
 

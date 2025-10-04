@@ -5,6 +5,7 @@ declare const crypto: Crypto;
 
 const LOCK_KEY = 'acct-token-rot-lock';
 const LOCK_TTL = 300; // seconds
+const SECRET_ID_KV_PREFIX = 'secretid:'; // KV key prefix for cached secret ids
 
 function randToken(): string {
 	return crypto.randomUUID();
@@ -28,69 +29,114 @@ export async function releaseLock(env: Env, token: string | null): Promise<void>
 	}
 }
 
-/** Secrets Store upsert via Cloudflare API (requires secret-edit bootstrap token) */
-/** Upsert a secret into Cloudflare Secrets Store (create or update).
- *  Uses env.SECRET_STORE_ID (must be set). Requires secretEditBootstrap to have Secrets Store write/edit rights.
- */
-export async function upsertSecret(env: Env, secretEditBootstrap: string, secretName: string, secretValue: string): Promise<void> {
+/** Resolve accountId and storeId from env */
+function resolveIds(env: Env): { accountId: string; storeId: string } {
 	const accountId = (env as any).ACCOUNT_ID ?? (env as any).account_id;
 	const storeId = (env as any).SECRET_STORE_ID;
-	if (!accountId) throw new Error('upsertSecret: account_id / ACCOUNT_ID not set in env');
-	if (!storeId) throw new Error('upsertSecret: SECRET_STORE_ID not set in env');
-
-	// 1) Try create (POST). This is the canonical Secrets Store create endpoint.
-	const createUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets`;
-	const createBody = {
-		name: secretName,
-		text: secretValue,
-		// attach to Workers runtime - keep this unless you need different services
-		services: ['workers'],
-	};
-
-	let res = await fetch(createUrl, {
-		method: 'POST',
-		headers: {
-			Authorization: `Bearer ${secretEditBootstrap}`,
-			'Content-Type': 'application/json',
-		},
-		body: JSON.stringify(createBody),
-	});
-
-	if (res.ok) return; // created successfully
-
-	// 2) If POST failed, try to update (PUT). Some accounts require updating existing secret by name.
-	//    Use the secrets/{secret_name} path for update (safe to URL-encode the name).
-	//    If your API returns a different shape for update, adapt accordingly.
-	const txt = await res.text().catch(() => '');
-	// If response indicates 'already exists' or other non-critical problem, fall back to update.
-	const updateUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets/${encodeURIComponent(
-		secretName
-	)}`;
-	res = await fetch(updateUrl, {
-		method: 'PUT',
-		headers: {
-			Authorization: `Bearer ${secretEditBootstrap}`,
-			'Content-Type': 'application/json',
-		},
-		body: JSON.stringify({ text: secretValue }),
-	});
-
-	if (!res.ok) {
-		const errText = await res.text().catch(() => txt || '<no body>');
-		throw new Error(`upsertSecret ${secretName} failed ${res.status} ${errText}`);
-	}
+	if (!accountId) throw new Error('account id not set in env (ACCOUNT_ID or account_id)');
+	if (!storeId) throw new Error('SECRET_STORE_ID not set in env');
+	return { accountId, storeId };
 }
 
-/** Create account API token via Cloudflare API (creationBootstrap must have create-token rights) */
-export async function createAccountToken(env: Env, creationBootstrap: string, tokenNameSuffix: string): Promise<string> {
-	const accountId = (env as any).ACCOUNT_ID ?? (env as any).account_id;
-	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/api_tokens`;
+/**
+ * Update existing secret by name
+ * - Uses simple KV caching of secret_id: if cached id fails, will list store and refresh.
+ * - Throws if secret not found or PATCH fails.
+ */
+export async function updateSecretByName(env: Env, secretEditBootstrap: string, secretName: string, secretValue: string): Promise<void> {
+	const { accountId, storeId } = resolveIds(env);
+	const headers = {
+		Authorization: `Bearer ${secretEditBootstrap}`,
+		'Content-Type': 'application/json',
+	};
+
+	// try cached id first
+	const cacheKey = SECRET_ID_KV_PREFIX + secretName;
+	let cachedId: string | null = null;
+	try {
+		cachedId = await env.KV_CACHE.get(cacheKey);
+	} catch (e) {
+		// KV read error -> ignore and continue to list fallback
+		console.warn('KV_CACHE.get failed (ignoring):', String(e));
+		cachedId = null;
+	}
+
+	async function patchById(secretId: string): Promise<void> {
+		const patchUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets/${encodeURIComponent(
+			secretId
+		)}`;
+		const patchRes = await fetch(patchUrl, {
+			method: 'PATCH',
+			headers,
+			body: JSON.stringify({ text: secretValue }),
+		});
+		if (!patchRes.ok) {
+			const t = await patchRes.text().catch(() => '<no body>');
+			throw new Error(`updateSecretByName: PATCH failed for id ${secretId} ${patchRes.status} ${t}`);
+		}
+		// success -> update KV cache (freshen TTL to LOCK_TTL*2 to be safe)
+		try {
+			await env.KV_CACHE.put(cacheKey, secretId, { expirationTtl: LOCK_TTL * 2 });
+		} catch (e) {
+			// ignore cache write failures
+			console.warn('KV_CACHE.put failed (ignoring):', String(e));
+		}
+	}
+
+	// If we have cachedId, try patching directly
+	if (cachedId) {
+		try {
+			await patchById(cachedId);
+			return;
+		} catch (e) {
+			// If patch fails with 404 or similar, drop cache and fall through to listing
+			console.warn('patchById with cachedId failed, will refresh list:', String(e));
+			try {
+				await env.KV_CACHE.delete(cacheKey);
+			} catch (_) {}
+		}
+	}
+
+	// List secrets and find the secret name
+	const listUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets`;
+	const listRes = await fetch(listUrl, { method: 'GET', headers });
+	if (!listRes.ok) {
+		const t = await listRes.text().catch(() => '<no body>');
+		throw new Error(`updateSecretByName: failed to list secrets for store ${storeId}: ${listRes.status} ${t}`);
+	}
+	const listJson = (await listRes.json()) as any;
+	const items: Array<{ id: string; name: string }> = listJson.result || [];
+	const found = items.find((it) => it.name === secretName);
+	if (!found) {
+		throw new Error(`updateSecretByName: secret "${secretName}" not found in store ${storeId}`);
+	}
+
+	// patch found secret id
+	await patchById(found.id);
+}
+
+/**
+ * Create an account token using the Accounts Tokens API.
+ * Returns the token string (value), id and expires.
+ *
+ * Note: this implementation assumes the account endpoint is /accounts/{accountId}/tokens
+ * and that the response contains result.value with the token secret string.
+ */
+export async function createAccountToken(
+	env: Env,
+	creationBootstrap: string,
+	tokenNameSuffix: string
+): Promise<{ value: string; id?: string; expires?: string }> {
+	const { accountId } = resolveIds(env);
+	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens`;
 	const expires_on = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(); // now + 2h
-	const body = {
+
+	const body: Record<string, any> = {
 		name: `auto-rotated-${tokenNameSuffix}-${Date.now()}`,
 		expires_on,
-		policies: [], // adapt to minimal policies required
+		// policies: [] // keep empty or add minimal policies as you require
 	};
+
 	const res = await fetch(url, {
 		method: 'POST',
 		headers: {
@@ -99,29 +145,33 @@ export async function createAccountToken(env: Env, creationBootstrap: string, to
 		},
 		body: JSON.stringify(body),
 	});
+
 	if (!res.ok) {
 		const t = await res.text().catch(() => '');
 		throw new Error(`createAccountToken failed ${res.status} ${t}`);
 	}
 
-	const payload = (await res.json()) as Record<string, any>;
-	const token = payload?.result?.token as string | undefined;
-	if (!token) throw new Error('createAccountToken: no token in response');
-	return token;
+	const payload = (await res.json()) as any;
+	const tokenValue = payload?.result?.value as string | undefined;
+	const id = payload?.result?.id as string | undefined;
+	const expires = payload?.result?.expires_on || expires_on;
+
+	if (!tokenValue) throw new Error('createAccountToken: no token value returned (payload.result.value missing)');
+
+	return { value: tokenValue, id, expires };
 }
 
-/** Lightweight verify */
-export async function verifyToken(token: string): Promise<boolean> {
-	const res = await fetch('https://api.cloudflare.com/client/v4/user/tokens/verify', {
-		method: 'GET',
-		headers: { Authorization: `Bearer ${token}` },
-	});
+/** Verify account token via tokens verify endpoint */
+export async function verifyToken(env: Env, token: string): Promise<boolean> {
+	const { accountId } = resolveIds(env);
+	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify`;
+	const res = await fetch(url, { method: 'GET', headers: { Authorization: `Bearer ${token}` } });
 	return res.ok;
 }
 
 /** Core rotation logic (2-slot model: PRIMARY <-> SECONDARY) */
 export async function rotateOnce(env: Env): Promise<void> {
-	// read bootstrap tokens (PRIMARY creation and secret-edit)
+	// Read bootstrap tokens (PRIMARY creation + PRIMARY secret-edit) from Secrets Store bindings
 	const [currCreation, currSecretEdit] = await Promise.all([env.PRIMARY_TOKEN_CREATION_TOKEN.get(), env.PRIMARY_SECRET_EDIT_TOKEN.get()]);
 
 	if (!currCreation || !currSecretEdit) {
@@ -130,11 +180,11 @@ export async function rotateOnce(env: Env): Promise<void> {
 
 	// 1) Stage: copy current PRIMARY values into SECONDARY names (idempotent)
 	await Promise.all([
-		upsertSecret(env, currSecretEdit, 'SECONDARY_TOKEN_CREATION_TOKEN', currCreation),
-		upsertSecret(env, currSecretEdit, 'SECONDARY_SECRET_EDIT_TOKEN', currSecretEdit),
+		updateSecretByName(env, currSecretEdit, 'SECONDARY_TOKEN_CREATION_TOKEN', currCreation),
+		updateSecretByName(env, currSecretEdit, 'SECONDARY_SECRET_EDIT_TOKEN', currSecretEdit),
 	]);
 
-	// 2) Create: new creation + new secret-edit tokens in parallel (both created using currCreation per your model)
+	// 2) Create new account tokens in parallel using currCreation bootstrap
 	const created = await Promise.allSettled([
 		createAccountToken(env, currCreation, 'creation-bootstrap'),
 		createAccountToken(env, currCreation, 'secret-edit-bootstrap'),
@@ -147,23 +197,25 @@ export async function rotateOnce(env: Env): Promise<void> {
 		throw new Error(`rotation: token creation failed: ${reasons.join(' | ')}`);
 	}
 
-	const newCreationToken = created[0].value as string;
-	const newSecretEditToken = created[1].value as string;
+	const newCreation = created[0].value as { value: string; id?: string; expires?: string };
+	const newSecretEdit = created[1].value as { value: string; id?: string; expires?: string };
 
-	// 3) Verify both tokens
-	const [v1, v2] = await Promise.all([
-		verifyToken(newCreationToken).catch(() => false),
-		verifyToken(newSecretEditToken).catch(() => false),
+	// 3) Verify new tokens
+	const [ok1, ok2] = await Promise.all([
+		verifyToken(env, newCreation.value).catch(() => false),
+		verifyToken(env, newSecretEdit.value).catch(() => false),
 	]);
-	if (!v1 || !v2) {
-		throw new Error(`rotation: verification failed (creation:${v1} secret-edit:${v2})`);
+	if (!ok1 || !ok2) {
+		throw new Error(`rotation: verification failed (creation:${ok1} secret-edit:${ok2})`);
 	}
 
-	// 4) Promote: overwrite PRIMARY_* bindings with new tokens
+	// 4) Promote: overwrite PRIMARY_* names with new token values (use currSecretEdit bootstrap to write)
 	await Promise.all([
-		upsertSecret(env, currSecretEdit, 'PRIMARY_TOKEN_CREATION_TOKEN', newCreationToken),
-		upsertSecret(env, currSecretEdit, 'PRIMARY_SECRET_EDIT_TOKEN', newSecretEditToken),
+		updateSecretByName(env, currSecretEdit, 'PRIMARY_TOKEN_CREATION_TOKEN', newCreation.value),
+		updateSecretByName(env, currSecretEdit, 'PRIMARY_SECRET_EDIT_TOKEN', newSecretEdit.value),
 	]);
+
+	// done
 }
 
 /** Default export — scheduled handler */
@@ -206,7 +258,7 @@ export default {
 			} catch (inner) {
 				console.error('rotation: error while handling error', inner);
 			}
-			// intentionally NOT rethrowing to keep scheduled handler silent after alert
+			// intentionally not rethrowing
 		} finally {
 			await releaseLock(env, lockToken);
 		}

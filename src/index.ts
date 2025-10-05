@@ -45,16 +45,35 @@ function readPermissionGroupIds(env: Env, envKey: string): string[] {
 	if (Array.isArray(raw)) return raw as string[];
 	if (typeof raw === 'string') {
 		const s = raw.trim();
-		// if looks like JSON array -> parse
 		if (s.startsWith('[')) {
 			try {
 				const parsed = JSON.parse(s);
 				if (Array.isArray(parsed)) return parsed;
 			} catch {
-				// fallthrough to treat as single id
+				/* fallthrough */
 			}
 		}
-		// single id
+		return [s];
+	}
+	return [];
+}
+
+/** Helper to read zone ids if we want zone-scoped resources (accept single id or JSON array string) */
+function readZoneIds(env: Env): string[] {
+	const raw = (env as any)['ZONE_IDS'];
+	if (!raw) return [];
+	if (Array.isArray(raw)) return raw as string[];
+	if (typeof raw === 'string') {
+		const s = raw.trim();
+		if (!s) return [];
+		if (s.startsWith('[')) {
+			try {
+				const parsed = JSON.parse(s);
+				if (Array.isArray(parsed)) return parsed;
+			} catch {
+				/* fallthrough */
+			}
+		}
 		return [s];
 	}
 	return [];
@@ -112,7 +131,7 @@ export async function updateSecretByName(env: Env, secretEditBootstrap: string, 
 			console.warn('patchById with cachedId failed, will refresh list:', String(e));
 			try {
 				await env.KV_CACHE.delete(cacheKey);
-			} catch (_) {}
+			} catch {}
 		}
 	}
 
@@ -139,8 +158,32 @@ export async function updateSecretByName(env: Env, secretEditBootstrap: string, 
 }
 
 /**
+ * Build the Cloudflare API token "resources" object.
+ * Defaults to ACCOUNT scope: {"com.cloudflare.api.account.<ACCOUNT_ID>": "*"}
+ * If env.TOKEN_RESOURCE_SCOPE === "zones", uses ZONE_IDS to grant per-zone scope.
+ */
+function buildResources(env: Env, accountId: string): Record<string, unknown> {
+	const scope = String((env as any).TOKEN_RESOURCE_SCOPE || '').toLowerCase() || 'account';
+
+	if (scope === 'zones') {
+		const zones = readZoneIds(env);
+		if (zones.length === 0) throw new Error('createAccountToken: TOKEN_RESOURCE_SCOPE="zones" but ZONE_IDS is empty');
+		const resources: Record<string, string> = {};
+		for (const zoneId of zones) {
+			resources[`com.cloudflare.api.account.zone.${zoneId}`] = '*';
+		}
+		return resources;
+	}
+
+	// account (default)
+	return { [`com.cloudflare.api.account.${accountId}`]: '*' };
+}
+
+/**
  * Create an account-owned API token.
  * - permissionGroupEnvKey: env key name that contains either a single id string or a JSON-array string.
+ * - TOKEN_RESOURCE_SCOPE: "account" (default) or "zones"
+ * - ZONE_IDS: single zone id or JSON array string, required when scope = "zones"
  */
 export async function createAccountToken(
 	env: Env,
@@ -155,10 +198,13 @@ export async function createAccountToken(
 		throw new Error(`createAccountToken: permission group ids missing in env key ${permissionGroupEnvKey}`);
 	}
 
-	// Build policies array expected by Cloudflare API
+	const resources = buildResources(env, accountId);
+
+	// Build policies: one policy per permission group, all with the required resources.
 	const policies = permissionGroupIds.map((id) => ({
 		effect: 'allow',
 		permission_groups: [{ id }],
+		resources,
 	}));
 
 	// expires_on must be ISO Z without milliseconds: 2005-12-30T01:02:03Z
@@ -186,7 +232,6 @@ export async function createAccountToken(
 	}
 
 	const payload = (await res.json()) as any;
-	// token string might be in result.value or result.token depending on API shape/version
 	const tokenValue = payload?.result?.value ?? payload?.result?.token;
 	const id = payload?.result?.id as string | undefined;
 	const expires = payload?.result?.expires_on || isoNoMs;
@@ -281,7 +326,7 @@ export default {
 							subject: 'CRITICAL! ROOT-TOKEN-MANAGER FAILURE',
 							plainText: `rotation failed:\n\n${errString}`,
 						},
-					});
+					} as any);
 				} catch (mailErr) {
 					console.error('rotation: mailer failed', String(mailErr));
 				}

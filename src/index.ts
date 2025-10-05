@@ -38,8 +38,29 @@ function resolveIds(env: Env): { accountId: string; storeId: string } {
 	return { accountId, storeId };
 }
 
-// --- paste into your index.ts to replace previous updateSecretByName / patchById ---
+/** Helper to read permission-group ids from env (accept single id string or JSON array string) */
+function readPermissionGroupIds(env: Env, envKey: string): string[] {
+	const raw = (env as any)[envKey];
+	if (!raw) return [];
+	if (Array.isArray(raw)) return raw as string[];
+	if (typeof raw === 'string') {
+		const s = raw.trim();
+		// if looks like JSON array -> parse
+		if (s.startsWith('[')) {
+			try {
+				const parsed = JSON.parse(s);
+				if (Array.isArray(parsed)) return parsed;
+			} catch {
+				// fallthrough to treat as single id
+			}
+		}
+		// single id
+		return [s];
+	}
+	return [];
+}
 
+/* PATCH secret by secretId (body uses { value: ... }) */
 async function patchById(
 	env: Env,
 	headers: Record<string, string>,
@@ -48,19 +69,8 @@ async function patchById(
 	secretId: string,
 	secretValue: string
 ): Promise<void> {
-	// basic sanity: ensure JSON serializable and not empty
-	let bodyObj: any = { value: secretValue };
-	let bodyStr: string;
-	try {
-		bodyStr = JSON.stringify(bodyObj);
-	} catch (e) {
-		throw new Error(`patchById: secret value not serializable: ${String(e)}`);
-	}
-
-	// optional quick debug logging (remove in prod)
-	if (bodyStr.length > 4096) {
-		console.warn(`patchById: secret payload length ${bodyStr.length} (might exceed store limits)`);
-	}
+	const bodyObj = { value: secretValue };
+	const bodyStr = JSON.stringify(bodyObj);
 
 	const patchUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets/${encodeURIComponent(
 		secretId
@@ -77,6 +87,7 @@ async function patchById(
 	}
 }
 
+/** Update an existing secret by name (fail-fast if not found). Caches secret-id in KV_CACHE. */
 export async function updateSecretByName(env: Env, secretEditBootstrap: string, secretName: string, secretValue: string): Promise<void> {
 	const { accountId, storeId } = resolveIds(env);
 	const headers = {
@@ -85,7 +96,6 @@ export async function updateSecretByName(env: Env, secretEditBootstrap: string, 
 	};
 
 	const cacheKey = SECRET_ID_KV_PREFIX + secretName;
-	// try cached id first
 	let cachedId: string | null = null;
 	try {
 		cachedId = await env.KV_CACHE.get(cacheKey);
@@ -106,7 +116,6 @@ export async function updateSecretByName(env: Env, secretEditBootstrap: string, 
 		}
 	}
 
-	// list secrets to find id
 	const listUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/secrets_store/stores/${storeId}/secrets`;
 	const listRes = await fetch(listUrl, { method: 'GET', headers });
 	if (!listRes.ok) {
@@ -122,7 +131,6 @@ export async function updateSecretByName(env: Env, secretEditBootstrap: string, 
 
 	await patchById(env, headers, accountId, storeId, found.id, secretValue);
 
-	// cache id for next time
 	try {
 		await env.KV_CACHE.put(cacheKey, found.id, { expirationTtl: LOCK_TTL * 2 });
 	} catch (e) {
@@ -131,27 +139,38 @@ export async function updateSecretByName(env: Env, secretEditBootstrap: string, 
 }
 
 /**
- * Create an account token using the Accounts Tokens API.
- * Returns the token string (value), id and expires.
- *
- * Note: this implementation assumes the account endpoint is /accounts/{accountId}/tokens
- * and that the response contains result.value with the token secret string.
+ * Create an account-owned API token.
+ * - permissionGroupEnvKey: env key name that contains either a single id string or a JSON-array string.
  */
 export async function createAccountToken(
 	env: Env,
 	creationBootstrap: string,
-	tokenNameSuffix: string
+	tokenNameSuffix: string,
+	permissionGroupEnvKey: string
 ): Promise<{ value: string; id?: string; expires?: string }> {
 	const { accountId } = resolveIds(env);
-	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens`;
-	const expires_on = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(); // now + 2h
 
-	const body: Record<string, any> = {
+	const permissionGroupIds = readPermissionGroupIds(env, permissionGroupEnvKey);
+	if (!permissionGroupIds || permissionGroupIds.length === 0) {
+		throw new Error(`createAccountToken: permission group ids missing in env key ${permissionGroupEnvKey}`);
+	}
+
+	// Build policies array expected by Cloudflare API
+	const policies = permissionGroupIds.map((id) => ({
+		effect: 'allow',
+		permission_groups: [{ id }],
+	}));
+
+	// expires_on must be ISO Z without milliseconds: 2005-12-30T01:02:03Z
+	const isoNoMs = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+	const body = {
 		name: `auto-rotated-${tokenNameSuffix}-${Date.now()}`,
-		expires_on,
-		// policies: [] // keep empty or add minimal policies as you require
+		expires_on: isoNoMs,
+		policies,
 	};
 
+	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens`;
 	const res = await fetch(url, {
 		method: 'POST',
 		headers: {
@@ -167,12 +186,11 @@ export async function createAccountToken(
 	}
 
 	const payload = (await res.json()) as any;
-	const tokenValue = payload?.result?.value as string | undefined;
+	// token string might be in result.value or result.token depending on API shape/version
+	const tokenValue = payload?.result?.value ?? payload?.result?.token;
 	const id = payload?.result?.id as string | undefined;
-	const expires = payload?.result?.expires_on || expires_on;
-
+	const expires = payload?.result?.expires_on || isoNoMs;
 	if (!tokenValue) throw new Error('createAccountToken: no token value returned (payload.result.value missing)');
-
 	return { value: tokenValue, id, expires };
 }
 
@@ -201,8 +219,8 @@ export async function rotateOnce(env: Env): Promise<void> {
 
 	// 2) Create new account tokens in parallel using currCreation bootstrap
 	const created = await Promise.allSettled([
-		createAccountToken(env, currCreation, 'creation-bootstrap'),
-		createAccountToken(env, currCreation, 'secret-edit-bootstrap'),
+		createAccountToken(env, currCreation, 'creation-bootstrap', 'CREATE_TOKENS_PERMISSION_GROUP_ID'),
+		createAccountToken(env, currCreation, 'secret-edit-bootstrap', 'EDIT_SECRETS_PERMISSION_GROUP_ID'),
 	]);
 
 	if (created[0].status !== 'fulfilled' || created[1].status !== 'fulfilled') {
@@ -229,8 +247,6 @@ export async function rotateOnce(env: Env): Promise<void> {
 		updateSecretByName(env, currSecretEdit, 'PRIMARY_TOKEN_CREATION_TOKEN', newCreation.value),
 		updateSecretByName(env, currSecretEdit, 'PRIMARY_SECRET_EDIT_TOKEN', newSecretEdit.value),
 	]);
-
-	// done
 }
 
 /** Default export — scheduled handler */
@@ -247,7 +263,6 @@ export default {
 			await rotateOnce(env);
 			console.log('rotation: success; primaries promoted; secondaries contain previous values');
 		} catch (err: any) {
-			// single log + single mail (do not rethrow)
 			try {
 				const errString =
 					typeof err === 'string'
